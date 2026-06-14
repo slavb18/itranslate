@@ -184,13 +184,19 @@ async function main() {
           startAudioStreaming(session);
         },
         onmessage: (message) => {
+          // Log key attributes of the incoming message for immediate diagnosis
+          if (message.error) {
+            console.error('\n\x1b[31m❌ [Gemini Live Server Error]:\x1b[0m', JSON.stringify(message.error, null, 2));
+            return;
+          }
+
           const content = message.serverContent;
           if (content) {
             if (content.inputTranscription?.text) {
-              process.stdout.write(`🇷🇺  Russian Input:  \x1b[33m${content.inputTranscription.text}\x1b[0m\n`);
+              process.stdout.write(`\n🇷🇺  Russian Input:  \x1b[33m${content.inputTranscription.text}\x1b[0m\n`);
             }
             if (content.outputTranscription?.text) {
-              process.stdout.write(`🇺🇸  English Translation: \x1b[32;1m${content.outputTranscription.text}\x1b[0m\n`);
+              process.stdout.write(`\n🇺🇸  English Translation: \x1b[32;1m${content.outputTranscription.text}\x1b[0m\n`);
             }
             if (content.modelTurn?.parts) {
               let audioPartsCount = 0;
@@ -213,9 +219,18 @@ async function main() {
                 }
               }
               if (audioPartsCount > 0) {
-                console.log(`📡 [Audio Received] Decoded ${audioPartsCount} English speech frames (${totalAudioBytes} bytes) from Gemini and streamed to local playback.`);
+                console.log(`\n📡 [Audio Received] Decoded ${audioPartsCount} English speech frames (${totalAudioBytes} bytes) from Gemini and streamed to local playback.`);
                 console.log(`💾 [Diag File Log] Appended to ${DEBUG_AUDIO_FILE} (size: ${fs.statSync(DEBUG_AUDIO_FILE).size} bytes). Run 'pw-play ${DEBUG_AUDIO_FILE}' to play/verify!`);
               }
+            }
+            if (content.turnComplete) {
+              console.log(`\n✨ [Gemini Live Turn Complete]`);
+            }
+          } else {
+            // Log other non-content events to see if they're coming through (e.g. toolCall, or simple server pings/keepalives)
+            const keys = Object.keys(message);
+            if (keys.length > 0) {
+              console.log(`\n📡 [Gemini Metadata Message Received]: Fields: [${keys.join(', ')}]`);
             }
           }
         },
@@ -381,84 +396,106 @@ function startAudioStreaming(session) {
 
   console.log('\n\x1b[34m🎙️  [LIVE RECORDING] Speak into your physical microphone now...\x1b[0m');
 
-  let hasSkippedWavHeader = false;
+  let isHeaderSkipped = false;
+  let headerAccumulator = Buffer.alloc(0);
+  let audioSendBuffer = Buffer.alloc(0);
+  const CHUNK_SEND_SIZE = 4096; // ~128ms at 16kHz 16-bit Mono (32KB/sec)
+
   let silentChunksCount = 0;
   let rollingMaxPeak = 0;
 
   recordProcess.stdout.on('data', (chunk) => {
-    let audioData = chunk;
-    
-    // Auto-detect and strip any WAV file headers produced by pw-record on stdout
-    if (usePipewire && !hasSkippedWavHeader) {
-      hasSkippedWavHeader = true;
-      if (chunk.length >= 44 && chunk.toString('ascii', 0, 4) === 'RIFF') {
-        console.log('🎙️  [Audio Capture] Detected auto-generated WAV header from pw-record. Stripping it for safe raw PCM streaming...');
-        audioData = chunk.subarray(44);
-      }
-    }
+    let pcmData;
 
-    if (audioData.length === 0) return;
-
-    // Append raw PCM data to the diagnostic input file for offline playing/testing
-    try {
-      fs.appendFileSync(DEBUG_INPUT_FILE, audioData);
-    } catch (writeErr) {
-      console.error('⚠️ Failed to append to diagnostic capture file:', writeErr.message);
-    }
-
-    // Analyze amplitude to detect 100% digital silence (muted hardware or wrong loopback source node)
-    let maxVal = 0;
-    for (let i = 0; i < audioData.length; i += 2) {
-      if (i + 1 < audioData.length) {
-        const sample = audioData.readInt16LE(i);
-        const absVal = Math.abs(sample);
-        if (absVal > maxVal) maxVal = absVal;
-      }
-    }
-
-    if (maxVal > rollingMaxPeak) {
-      rollingMaxPeak = maxVal;
-    }
-
-    if (maxVal < 10) {
-      silentChunksCount++;
-      if (silentChunksCount === 80) { // after ~8-10 seconds of pure silence
-        console.warn('\n\x1b[33m⚠️  AUDIO STAGE WARNING: Captured stream is 100% digitally silent (flatline)!\x1b[0m');
-        console.warn('   This usually means your physical microphone is muted in your OS settings or');
-        console.warn('   PipeWire was routed to your Virtual_Source/Sink instead of your physical voice capture device.');
-        console.warn('   Run standard diagnostics or launch with explicit input:');
-        console.warn('   \x1b[36mnode cli-translator.js --source <your-physical-microphone-id-or-name>\x1b[0m\n');
+    if (!isHeaderSkipped) {
+      headerAccumulator = Buffer.concat([headerAccumulator, chunk]);
+      if (headerAccumulator.length >= 44) {
+        isHeaderSkipped = true;
+        if (headerAccumulator.subarray(0, 4).toString('ascii') === 'RIFF') {
+          console.log('\n🎙️  [Audio Capture] Detected auto-generated WAV header from pw-record. Stripping it for safe raw PCM streaming...');
+          pcmData = headerAccumulator.subarray(44);
+        } else {
+          console.log('\n🎙️  [Audio Capture] Analysed first 44 bytes. No RIFF header found. Treating input stream as raw PCM...');
+          pcmData = headerAccumulator;
+        }
+      } else {
+        // Collect more bytes to reach 44 bytes
+        return;
       }
     } else {
-      if (silentChunksCount >= 80) {
-        console.log('\n\x1b[32m🎤 [Voice Stream] Real audio signal detected! Mute or silence resolved.\x1b[0m\n');
+      pcmData = chunk;
+    }
+
+    if (!pcmData || pcmData.length === 0) return;
+
+    // Append to diagnostic CAPTURE file for offline playing/testing
+    try {
+      fs.appendFileSync(DEBUG_INPUT_FILE, pcmData);
+    } catch (writeErr) {
+      console.error('⚠️ Failed to append raw PCM chunk to diagnostic file:', writeErr.message);
+    }
+
+    // Accumulate the PCM chunks to send a steady, appropriately sized stream of buffers to Gemini
+    audioSendBuffer = Buffer.concat([audioSendBuffer, pcmData]);
+
+    while (audioSendBuffer.length >= CHUNK_SEND_SIZE) {
+      const sendChunk = audioSendBuffer.subarray(0, CHUNK_SEND_SIZE);
+      audioSendBuffer = audioSendBuffer.subarray(CHUNK_SEND_SIZE);
+
+      // Analyze amplitude to detect 100% digital silence in the sent chunk
+      let maxVal = 0;
+      for (let i = 0; i < sendChunk.length; i += 2) {
+        if (i + 1 < sendChunk.length) {
+          const sample = sendChunk.readInt16LE(i);
+          const absVal = Math.abs(sample);
+          if (absVal > maxVal) maxVal = absVal;
+        }
       }
-      silentChunksCount = 0;
-    }
 
-    chunkCount++;
-    totalBytesSent += audioData.length;
-    
-    // Periodically report streaming health status & amplitude peaks to terminal (every 40 chunks = ~4-5s)
-    if (chunkCount % 40 === 0) {
-      let inputSize = 0;
-      try {
-        inputSize = fs.statSync(DEBUG_INPUT_FILE).size;
-      } catch (e) {}
-      process.stdout.write(`\r\x1b[36m⚡ Audio Live Tracker: Captured ${chunkCount} chunks (${Math.round(totalBytesSent / 1024)} KB sent so far) | Signal Level: [Peak Value: ${rollingMaxPeak}/32767] | Saved to File: ${Math.round(inputSize / 1024)} KB\x1b[0m`);
-      rollingMaxPeak = 0;
-    }
+      if (maxVal > rollingMaxPeak) {
+        rollingMaxPeak = maxVal;
+      }
 
-    if (session) {
-      try {
-        session.sendRealtimeInput({
-          audio: {
-            data: audioData.toString('base64'),
-            mimeType: `audio/pcm;rate=${RECORD_RATE}`
-          }
-        });
-      } catch (err) {
-        console.error(`\r❌ Error sending audio to Gemini Live:`, err.message);
+      if (maxVal < 10) {
+        silentChunksCount++;
+        if (silentChunksCount === 80) { // after ~8-10 seconds of pure silence
+          console.warn('\n\x1b[33m⚠️  AUDIO STAGE WARNING: Captured stream is 100% digitally silent (flatline)!\x1b[0m');
+          console.warn('   This usually means your physical microphone is muted in your OS settings or');
+          console.warn('   PipeWire was routed to your Virtual_Source/Sink instead of your physical voice capture device.');
+          console.warn('   Run standard diagnostics or launch with explicit input:');
+          console.warn('   \x1b[36mnode cli-translator.js --source <your-physical-microphone-id-or-name>\x1b[0m\n');
+        }
+      } else {
+        if (silentChunksCount >= 80) {
+          console.log('\n\x1b[32m🎤 [Voice Stream] Real audio signal detected! Mute or silence resolved.\x1b[0m\n');
+        }
+        silentChunksCount = 0;
+      }
+
+      chunkCount++;
+      totalBytesSent += sendChunk.length;
+
+      // Periodically report streaming health status & amplitude peaks to terminal (every 40 chunks = ~4-5s)
+      if (chunkCount % 40 === 0) {
+        let inputSize = 0;
+        try {
+          inputSize = fs.statSync(DEBUG_INPUT_FILE).size;
+        } catch (e) {}
+        process.stdout.write(`\r\x1b[36m⚡ Audio Live Tracker: Captured ${chunkCount} chunks (${Math.round(totalBytesSent / 1024)} KB sent so far) | Signal Level: [Peak Value: ${rollingMaxPeak}/32767] | Saved to File: ${Math.round(inputSize / 1024)} KB\x1b[0m`);
+        rollingMaxPeak = 0;
+      }
+
+      if (session) {
+        try {
+          session.sendRealtimeInput({
+            audio: {
+              data: sendChunk.toString('base64'),
+              mimeType: `audio/pcm;rate=${RECORD_RATE}`
+            }
+          });
+        } catch (err) {
+          console.error(`\r❌ Error sending audio to Gemini Live:`, err.message);
+        }
       }
     }
   });
