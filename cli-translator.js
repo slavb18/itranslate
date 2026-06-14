@@ -114,34 +114,44 @@ async function main() {
 }
 
 let playbackProcess = null;
+let chunkCount = 0;
+let totalBytesSent = 0;
 
 function playTranslatedPcm(base64Audio) {
   if (!playbackProcess) {
-    if (usePipewire) {
-      playbackProcess = spawn('pw-play', [
-        '--format=s16',
-        `--rate=${PLAYBACK_RATE}`,
-        '--channels=1',
-        `--target=${TARGET_SINK}`,
-        '-'
-      ]);
-    } else {
-      // Fallback: standard aplay device routing
-      playbackProcess = spawn('aplay', [
-        '-t', 'raw',
-        '-f', 'S16_LE',
-        '-r', `${PLAYBACK_RATE}`,
-        '-c', '1',
-        '-D', TARGET_SINK === 'Virtual_Sink' ? 'default' : TARGET_SINK,
-        '-'
-      ]);
-    }
+    const args = usePipewire 
+      ? [
+          '--format=s16',
+          `--rate=${PLAYBACK_RATE}`,
+          '--channels=1',
+          `--target=${TARGET_SINK}`,
+          '-'
+        ]
+      : [
+          '-t', 'raw',
+          '-f', 'S16_LE',
+          '-r', `${PLAYBACK_RATE}`,
+          '-c', '1',
+          '-D', TARGET_SINK === 'Virtual_Sink' ? 'default' : TARGET_SINK,
+          '-'
+        ];
+
+    const cmd = usePipewire ? 'pw-play' : 'aplay';
+    console.log(`🔊 [Playback Channel] Spawning standard audio player: \x1b[32m${cmd} ${args.join(' ')}\x1b[0m`);
+    
+    playbackProcess = spawn(cmd, args);
 
     playbackProcess.on('error', (err) => {
-      console.error('Playback utility execution error:', err.message);
+      console.error(`\x1b[31m❌ Playback process error:\x1b[0m`, err.message);
     });
 
-    playbackProcess.on('close', () => {
+    // Capture and display playback utility errors for user diagnosis
+    playbackProcess.stderr.on('data', (data) => {
+      console.warn(`\x1b[33m[Audio Playback Warning] >>> ${data.toString().trim()}\x1b[0m`);
+    });
+
+    playbackProcess.on('close', (code) => {
+      console.log(`🔊 [Playback Channel] Playback process closed with code: ${code}`);
       playbackProcess = null;
     });
   }
@@ -151,58 +161,105 @@ function playTranslatedPcm(base64Audio) {
       const audioBuffer = Buffer.from(base64Audio, 'base64');
       playbackProcess.stdin.write(audioBuffer);
     } catch (e) {
-      // handle partial pipe write limits
+      console.error(`❌ Playback channel buffering failure:`, e.message);
     }
   }
 }
 
 function startAudioStreaming(session) {
   let recordProcess;
+  const cmd = usePipewire ? 'pw-record' : 'arecord';
+  const args = usePipewire
+    ? [
+        '--format=s16',
+        `--rate=${RECORD_RATE}`,
+        '--channels=1',
+        '-'
+      ]
+    : [
+        '-t', 'raw',
+        '-f', 'S16_LE',
+        '-r', `${RECORD_RATE}`,
+        '-c', '1',
+        '-'
+      ];
 
-  if (usePipewire) {
-    recordProcess = spawn('pw-record', [
-      '--format=s16',
-      `--rate=${RECORD_RATE}`,
-      '--channels=1',
-      '-'
-    ]);
-  } else {
-    // Fallback: standard arecord capturing audio
-    recordProcess = spawn('arecord', [
-      '-t', 'raw',
-      '-f', 'S16_LE',
-      '-r', `${RECORD_RATE}`,
-      '-c', '1',
-      '-'
-    ]);
+  console.log(`🎙️  [Audio Capture] Spawning driver: \x1b[34m${cmd} ${args.join(' ')}\x1b[0m`);
+
+  try {
+    recordProcess = spawn(cmd, args);
+  } catch (err) {
+    console.error(`\x1b[31m❌ Critial err: Failed to launch ${cmd} recorder process:\x1b[0m`, err);
+    process.exit(1);
   }
+
+  recordProcess.on('error', (err) => {
+    console.error(`\x1b[31m❌ Recorder process emit/spawn error:\x1b[0m`, err.message);
+  });
+
+  // Pipe Recorder stderr directly so we can diagnose permission/device issues
+  recordProcess.stderr.on('data', (data) => {
+    const msg = data.toString().trim();
+    if (msg) {
+      console.warn(`\x1b[33m[Microphone Hardware Warning] >>> ${msg}\x1b[5m`);
+    }
+  });
+
+  // Setup timeout to warn user if no mic data is flowing
+  const micWarningTimeout = setTimeout(() => {
+    if (chunkCount === 0) {
+      console.warn('\n\x1b[33m⚠️  WARNING: No audio data has been received from the microphone after 4 seconds!\x1b[0m');
+      console.warn('Common causes:');
+      console.warn(' 1. Your physical microphone is muted or in use by another application.');
+      console.warn(' 2. PipeWire has no default source set. Try verifying with: \x1b[1mpw-record test.wav\x1b[0m');
+      console.warn(' 3. Run with ALSA instead by temporarily renaming/disabling pw-record if it is hanging.\n');
+    }
+  }, 4000);
 
   console.log('\n\x1b[34m🎙️  [LIVE RECORDING] Speak into your physical microphone now...\x1b[0m');
 
   recordProcess.stdout.on('data', (chunk) => {
+    chunkCount++;
+    totalBytesSent += chunk.length;
+    
+    // Periodically report streaming health status to terminal (every 50 chunks = ~5s)
+    if (chunkCount % 40 === 0) {
+      process.stdout.write(`\r\x1b[36m⚡ Streaming active: captured ${chunkCount} chunks (${Math.round(totalBytesSent / 1024)} KB sent)\x1b[0m`);
+    }
+
     if (session) {
-      session.sendRealtimeInput({
-        audio: {
-          data: chunk.toString('base64'),
-          mimeType: `audio/pcm;rate=${RECORD_RATE}`
-        }
-      });
+      try {
+        session.sendRealtimeInput({
+          audio: {
+            data: chunk.toString('base64'),
+            mimeType: `audio/pcm;rate=${RECORD_RATE}`
+          }
+        });
+      } catch (err) {
+        console.error(`\r❌ Error sending audio to Gemini Live:`, err.message);
+      }
     }
   });
 
-  recordProcess.stderr.on('data', (data) => {
-    // Quietly ignore command logging
-  });
-
   recordProcess.on('close', (code) => {
-    console.log(`\nRecorder stopped (Code: ${code})`);
-    if (session) session.close();
+    clearTimeout(micWarningTimeout);
+    console.log(`\n🎙️  Recorder process closed (Exit Code: ${code})`);
+    if (session) {
+      console.log('🔌 Shutting down Gemini live session...');
+      session.close();
+    }
   });
 
   process.on('SIGINT', () => {
     console.log('\nShutting down translator CLI session gracefully...');
-    recordProcess.kill('SIGINT');
-    if (playbackProcess) playbackProcess.kill('SIGINT');
+    try {
+      recordProcess.kill('SIGINT');
+    } catch(e){}
+    if (playbackProcess) {
+      try {
+        playbackProcess.kill('SIGINT');
+      } catch(e){}
+    }
     process.exit(0);
   });
 }
