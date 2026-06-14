@@ -350,7 +350,6 @@ function startAudioStreaming(session) {
         '--format=s16',
         `--rate=${RECORD_RATE}`,
         '--channels=1',
-        '--file-format=wav',
         ...(CAPTURE_SOURCE ? [`--target=${CAPTURE_SOURCE}`] : []),
         '-'
       ]
