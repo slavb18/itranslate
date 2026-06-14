@@ -124,6 +124,7 @@ function playTranslatedPcm(base64Audio) {
           '--format=s16',
           `--rate=${PLAYBACK_RATE}`,
           '--channels=1',
+          '--type=raw',
           `--target=${TARGET_SINK}`,
           '-'
         ]
@@ -174,6 +175,7 @@ function startAudioStreaming(session) {
         '--format=s16',
         `--rate=${RECORD_RATE}`,
         '--channels=1',
+        '--type=raw',
         '-'
       ]
     : [

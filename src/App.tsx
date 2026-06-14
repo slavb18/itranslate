@@ -473,7 +473,7 @@ async function main() {
   });
   
   // Records raw voice from physical microphone
-  const recorder = spawn('pw-record', ['--format=s16', '--rate=16000', '--channels=1', '-']);
+  const recorder = spawn('pw-record', ['--format=s16', '--rate=16000', '--channels=1', '--type=raw', '-']);
   recorder.stdout.on('data', c => {
     session.sendRealtimeInput({ audio: { data: c.toString('base64'), mimeType: "audio/pcm;rate=16000" } });
   });
@@ -481,7 +481,7 @@ async function main() {
 
 let player = null;
 function playAudio(base64) {
-  if (!player) player = spawn('pw-play', ['--format=s16', '--rate=24000', '--channels=1', '--target=Virtual_Sink', '-']);
+  if (!player) player = spawn('pw-play', ['--format=s16', '--rate=24000', '--channels=1', '--type=raw', '--target=Virtual_Sink', '-']);
   player.stdin.write(Buffer.from(base64, 'base64'));
 }
 main();`;
@@ -1043,6 +1043,7 @@ function playTranslatedPcm(base64Audio) {
       '--format=s16',
       '--rate=24000',
       '--channels=1',
+      '--type=raw',
       '--target=Virtual_Sink',
       '-'
     ]);
@@ -1057,6 +1058,7 @@ function startAudioStreaming(session) {
     '--format=s16',
     '--rate=16000',
     '--channels=1',
+    '--type=raw',
     '-'
   ]);
 
