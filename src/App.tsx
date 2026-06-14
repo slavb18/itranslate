@@ -473,15 +473,41 @@ async function main() {
   });
   
   // Records raw voice from physical microphone
-  const recorder = spawn('pw-record', ['--format=s16', '--rate=16000', '--channels=1', '--type=raw', '-']);
+  let hasSkippedWav = false;
+  const recorder = spawn('pw-record', ['--format=s16', '--rate=16000', '--channels=1', '-']);
   recorder.stdout.on('data', c => {
-    session.sendRealtimeInput({ audio: { data: c.toString('base64'), mimeType: "audio/pcm;rate=16000" } });
+    let audio = c;
+    if (!hasSkippedWav) {
+      hasSkippedWav = true;
+      if (c.length >= 44 && c.toString('ascii', 0, 4) === 'RIFF') audio = c.subarray(44);
+    }
+    if (audio.length > 0) {
+      session.sendRealtimeInput({ audio: { data: audio.toString('base64'), mimeType: "audio/pcm;rate=16000" } });
+    }
   });
 }
 
+function createWavHeader(rate, ch, bits) {
+  const b = Buffer.alloc(44);
+  b.write('RIFF', 0); b.writeUInt32LE(2147483647, 4); b.write('WAVE', 8);
+  b.write('fmt ', 12); b.writeUInt32LE(16, 16); b.writeUInt16LE(1, 20);
+  b.writeUInt16LE(ch, 22); b.writeUInt32LE(rate, 24); b.writeUInt32LE((rate * ch * bits) / 8, 28);
+  b.writeUInt16LE((ch * bits) / 8, 32); b.writeUInt16LE(bits, 34); b.write('data', 36); b.writeUInt32LE(2147483603, 40);
+  return b;
+}
+
 let player = null;
+let playerHeaderSent = false;
 function playAudio(base64) {
-  if (!player) player = spawn('pw-play', ['--format=s16', '--rate=24000', '--channels=1', '--type=raw', '--target=Virtual_Sink', '-']);
+  if (!player) {
+    player = spawn('pw-play', ['--target=Virtual_Sink', '-']);
+    playerHeaderSent = false;
+    player.on('close', () => { player = null; playerHeaderSent = false; });
+  }
+  if (!playerHeaderSent) {
+    player.stdin.write(createWavHeader(24000, 1, 16));
+    playerHeaderSent = true;
+  }
   player.stdin.write(Buffer.from(base64, 'base64'));
 }
 main();`;
@@ -1036,20 +1062,50 @@ async function main() {
   });
 }
 
+// Helper to generate a WAV header for streaming (huge size)
+function createWavHeader(sampleRate, numChannels, bitsPerSample) {
+  const buffer = Buffer.alloc(44);
+  buffer.write('RIFF', 0);
+  buffer.writeUInt32LE(2147483647, 4); 
+  buffer.write('WAVE', 8);
+  buffer.write('fmt ', 12);
+  buffer.writeUInt32LE(16, 16);
+  buffer.writeUInt16LE(1, 20); // Linear PCM
+  buffer.writeUInt16LE(numChannels, 22);
+  buffer.writeUInt32LE(sampleRate, 24);
+  const byteRate = (sampleRate * numChannels * bitsPerSample) / 8;
+  buffer.writeUInt32LE(byteRate, 28);
+  const blockAlign = (numChannels * bitsPerSample) / 8;
+  buffer.writeUInt16LE(blockAlign, 32);
+  buffer.writeUInt16LE(bitsPerSample, 34);
+  buffer.write('data', 36);
+  buffer.writeUInt32LE(2147483603, 40); // Large length
+  return buffer;
+}
+
 let playbackProcess = null;
+let isPlaybackHeaderSent = false;
+
 function playTranslatedPcm(base64Audio) {
   if (!playbackProcess) {
     playbackProcess = spawn('pw-play', [
-      '--format=s16',
-      '--rate=24000',
-      '--channels=1',
-      '--type=raw',
       '--target=Virtual_Sink',
       '-'
     ]);
+    isPlaybackHeaderSent = false;
+    playbackProcess.on('close', () => {
+      playbackProcess = null;
+      isPlaybackHeaderSent = false;
+    });
   }
   if (playbackProcess && playbackProcess.stdin.writable) {
-    playbackProcess.stdin.write(Buffer.from(base64Audio, 'base64'));
+    try {
+      if (!isPlaybackHeaderSent) {
+        playbackProcess.stdin.write(createWavHeader(24000, 1, 16));
+        isPlaybackHeaderSent = true;
+      }
+      playbackProcess.stdin.write(Buffer.from(base64Audio, 'base64'));
+    } catch (e) {}
   }
 }
 
@@ -1058,14 +1114,25 @@ function startAudioStreaming(session) {
     '--format=s16',
     '--rate=16000',
     '--channels=1',
-    '--type=raw',
     '-'
   ]);
 
+  let hasSkippedWavHeader = false;
+
   recordProcess.stdout.on('data', (chunk) => {
+    let audioData = chunk;
+    if (!hasSkippedWavHeader) {
+      hasSkippedWavHeader = true;
+      if (chunk.length >= 44 && chunk.toString('ascii', 0, 4) === 'RIFF') {
+        audioData = chunk.subarray(44);
+      }
+    }
+
+    if (audioData.length === 0) return;
+
     session.sendRealtimeInput({
       audio: {
-        data: chunk.toString('base64'),
+        data: audioData.toString('base64'),
         mimeType: "audio/pcm;rate=16000"
       }
     });

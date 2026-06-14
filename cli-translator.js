@@ -113,7 +113,37 @@ async function main() {
   }
 }
 
+// Helper to generate a WAV header for streaming (huge size)
+function createWavHeader(sampleRate, numChannels, bitsPerSample) {
+  const buffer = Buffer.alloc(44);
+  
+  // RIFF identifier
+  buffer.write('RIFF', 0);
+  // We use a very large size to represent a continuous stream
+  buffer.writeUInt32LE(2147483647, 4); 
+  buffer.write('WAVE', 8);
+  
+  // Format chunk identifier
+  buffer.write('fmt ', 12);
+  buffer.writeUInt32LE(16, 16);
+  buffer.writeUInt16LE(1, 20); // Linear PCM
+  buffer.writeUInt16LE(numChannels, 22);
+  buffer.writeUInt32LE(sampleRate, 24);
+  const byteRate = (sampleRate * numChannels * bitsPerSample) / 8;
+  buffer.writeUInt32LE(byteRate, 28);
+  const blockAlign = (numChannels * bitsPerSample) / 8;
+  buffer.writeUInt16LE(blockAlign, 32);
+  buffer.writeUInt16LE(bitsPerSample, 34);
+  
+  // Data chunk identifier
+  buffer.write('data', 36);
+  buffer.writeUInt32LE(2147483603, 40); // Large length
+  
+  return buffer;
+}
+
 let playbackProcess = null;
+let isPlaybackHeaderSent = false;
 let chunkCount = 0;
 let totalBytesSent = 0;
 
@@ -121,10 +151,6 @@ function playTranslatedPcm(base64Audio) {
   if (!playbackProcess) {
     const args = usePipewire 
       ? [
-          '--format=s16',
-          `--rate=${PLAYBACK_RATE}`,
-          '--channels=1',
-          '--type=raw',
           `--target=${TARGET_SINK}`,
           '-'
         ]
@@ -141,6 +167,7 @@ function playTranslatedPcm(base64Audio) {
     console.log(`🔊 [Playback Channel] Spawning standard audio player: \x1b[32m${cmd} ${args.join(' ')}\x1b[0m`);
     
     playbackProcess = spawn(cmd, args);
+    isPlaybackHeaderSent = false;
 
     playbackProcess.on('error', (err) => {
       console.error(`\x1b[31m❌ Playback process error:\x1b[0m`, err.message);
@@ -154,12 +181,22 @@ function playTranslatedPcm(base64Audio) {
     playbackProcess.on('close', (code) => {
       console.log(`🔊 [Playback Channel] Playback process closed with code: ${code}`);
       playbackProcess = null;
+      isPlaybackHeaderSent = false;
     });
   }
 
   if (playbackProcess && playbackProcess.stdin.writable) {
     try {
       const audioBuffer = Buffer.from(base64Audio, 'base64');
+      
+      // For PipeWire, prepend a standard WAV container header so pw-play understands it
+      if (usePipewire && !isPlaybackHeaderSent) {
+        const header = createWavHeader(PLAYBACK_RATE, 1, 16);
+        playbackProcess.stdin.write(header);
+        isPlaybackHeaderSent = true;
+        console.log(`🔊 [Playback Channel] Pre-pended standard WAV header to stdin stream.`);
+      }
+
       playbackProcess.stdin.write(audioBuffer);
     } catch (e) {
       console.error(`❌ Playback channel buffering failure:`, e.message);
@@ -175,7 +212,6 @@ function startAudioStreaming(session) {
         '--format=s16',
         `--rate=${RECORD_RATE}`,
         '--channels=1',
-        '--type=raw',
         '-'
       ]
     : [
@@ -220,11 +256,26 @@ function startAudioStreaming(session) {
 
   console.log('\n\x1b[34m🎙️  [LIVE RECORDING] Speak into your physical microphone now...\x1b[0m');
 
+  let hasSkippedWavHeader = false;
+
   recordProcess.stdout.on('data', (chunk) => {
-    chunkCount++;
-    totalBytesSent += chunk.length;
+    let audioData = chunk;
     
-    // Periodically report streaming health status to terminal (every 50 chunks = ~5s)
+    // Auto-detect and strip any WAV file headers produced by pw-record on stdout
+    if (usePipewire && !hasSkippedWavHeader) {
+      hasSkippedWavHeader = true;
+      if (chunk.length >= 44 && chunk.toString('ascii', 0, 4) === 'RIFF') {
+        console.log('🎙️  [Audio Capture] Detected auto-generated WAV header from pw-record. Stripping it for safe raw PCM streaming...');
+        audioData = chunk.subarray(44);
+      }
+    }
+
+    if (audioData.length === 0) return;
+
+    chunkCount++;
+    totalBytesSent += audioData.length;
+    
+    // Periodically report streaming health status to terminal (every 40 chunks = ~4-5s)
     if (chunkCount % 40 === 0) {
       process.stdout.write(`\r\x1b[36m⚡ Streaming active: captured ${chunkCount} chunks (${Math.round(totalBytesSent / 1024)} KB sent)\x1b[0m`);
     }
@@ -233,7 +284,7 @@ function startAudioStreaming(session) {
       try {
         session.sendRealtimeInput({
           audio: {
-            data: chunk.toString('base64'),
+            data: audioData.toString('base64'),
             mimeType: `audio/pcm;rate=${RECORD_RATE}`
           }
         });
