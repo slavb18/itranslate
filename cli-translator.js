@@ -350,6 +350,7 @@ function startAudioStreaming(session) {
         '--format=s16',
         `--rate=${RECORD_RATE}`,
         '--channels=1',
+        '--file-format=raw',
         ...(CAPTURE_SOURCE ? [`--target=${CAPTURE_SOURCE}`] : []),
         '-'
       ]
@@ -397,7 +398,7 @@ function startAudioStreaming(session) {
   console.log('\n\x1b[34m🎙️  [LIVE RECORDING] Speak into your physical microphone now...\x1b[0m');
 
   let isHeaderSkipped = false;
-  let headerAccumulator = Buffer.alloc(0);
+  let rawInputBuffer = Buffer.alloc(0);
   let audioSendBuffer = Buffer.alloc(0);
   const CHUNK_SEND_SIZE = 4096; // ~128ms at 16kHz 16-bit Mono (32KB/sec)
 
@@ -405,26 +406,32 @@ function startAudioStreaming(session) {
   let rollingMaxPeak = 0;
 
   recordProcess.stdout.on('data', (chunk) => {
-    let pcmData;
+    // Accumulate all incoming bytes
+    rawInputBuffer = Buffer.concat([rawInputBuffer, chunk]);
 
+    // Strip legacy RIFF headers if generated
     if (!isHeaderSkipped) {
-      headerAccumulator = Buffer.concat([headerAccumulator, chunk]);
-      if (headerAccumulator.length >= 44) {
-        isHeaderSkipped = true;
-        if (headerAccumulator.subarray(0, 4).toString('ascii') === 'RIFF') {
+      if (rawInputBuffer.length >= 44) {
+        if (rawInputBuffer.subarray(0, 4).toString('ascii') === 'RIFF') {
           console.log('\n🎙️  [Audio Capture] Detected auto-generated WAV header from pw-record. Stripping it for safe raw PCM streaming...');
-          pcmData = headerAccumulator.subarray(44);
+          rawInputBuffer = rawInputBuffer.subarray(44);
         } else {
           console.log('\n🎙️  [Audio Capture] Analysed first 44 bytes. No RIFF header found. Treating input stream as raw PCM...');
-          pcmData = headerAccumulator;
         }
+        isHeaderSkipped = true;
       } else {
-        // Collect more bytes to reach 44 bytes
+        // Wait for more bytes to verify header format safely
         return;
       }
-    } else {
-      pcmData = chunk;
     }
+
+    // CRITICAL: Force even alignment (16-bit / 2-byte sample boundaries) for 16-bit PCM
+    const len = rawInputBuffer.length;
+    const evenLen = len - (len % 2);
+    if (evenLen === 0) return;
+
+    const pcmData = rawInputBuffer.subarray(0, evenLen);
+    rawInputBuffer = rawInputBuffer.subarray(evenLen); // Keep the odd byte for the next event if any
 
     if (!pcmData || pcmData.length === 0) return;
 
