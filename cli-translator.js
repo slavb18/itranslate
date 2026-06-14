@@ -88,11 +88,19 @@ try {
 }
 console.log('\x1b[34m────────────────────────────────────────────────────────\x1b[0m\n');
 
-// Clean start for the physical debug audio translation trace file
+// Clean start for the physical debug audio translation trace files
 const DEBUG_AUDIO_FILE = './debug_received_english.pcm';
+const DEBUG_INPUT_FILE = './debug_captured_russian_mic.pcm';
+
 try {
   if (fs.existsSync(DEBUG_AUDIO_FILE)) {
     fs.unlinkSync(DEBUG_AUDIO_FILE);
+  }
+} catch (e) {}
+
+try {
+  if (fs.existsSync(DEBUG_INPUT_FILE)) {
+    fs.unlinkSync(DEBUG_INPUT_FILE);
   }
 } catch (e) {}
 
@@ -316,8 +324,8 @@ function startAudioStreaming(session) {
   console.log('\n\x1b[34m🎙️  [LIVE RECORDING] Speak into your physical microphone now...\x1b[0m');
 
   let hasSkippedWavHeader = false;
-
   let silentChunksCount = 0;
+  let rollingMaxPeak = 0;
 
   recordProcess.stdout.on('data', (chunk) => {
     let audioData = chunk;
@@ -333,6 +341,13 @@ function startAudioStreaming(session) {
 
     if (audioData.length === 0) return;
 
+    // Append raw PCM data to the diagnostic input file for offline playing/testing
+    try {
+      fs.appendFileSync(DEBUG_INPUT_FILE, audioData);
+    } catch (writeErr) {
+      console.error('⚠️ Failed to append to diagnostic capture file:', writeErr.message);
+    }
+
     // Analyze amplitude to detect 100% digital silence (muted hardware or wrong loopback source node)
     let maxVal = 0;
     for (let i = 0; i < audioData.length; i += 2) {
@@ -341,6 +356,10 @@ function startAudioStreaming(session) {
         const absVal = Math.abs(sample);
         if (absVal > maxVal) maxVal = absVal;
       }
+    }
+
+    if (maxVal > rollingMaxPeak) {
+      rollingMaxPeak = maxVal;
     }
 
     if (maxVal < 10) {
@@ -362,9 +381,14 @@ function startAudioStreaming(session) {
     chunkCount++;
     totalBytesSent += audioData.length;
     
-    // Periodically report streaming health status to terminal (every 40 chunks = ~4-5s)
+    // Periodically report streaming health status & amplitude peaks to terminal (every 40 chunks = ~4-5s)
     if (chunkCount % 40 === 0) {
-      process.stdout.write(`\r\x1b[36m⚡ Streaming active: captured ${chunkCount} chunks (${Math.round(totalBytesSent / 1024)} KB sent)\x1b[0m`);
+      let inputSize = 0;
+      try {
+        inputSize = fs.statSync(DEBUG_INPUT_FILE).size;
+      } catch (e) {}
+      process.stdout.write(`\r\x1b[36m⚡ Audio Live Tracker: Captured ${chunkCount} chunks (${Math.round(totalBytesSent / 1024)} KB sent so far) | Signal Level: [Peak Value: ${rollingMaxPeak}/32767] | Saved to File: ${Math.round(inputSize / 1024)} KB\x1b[0m`);
+      rollingMaxPeak = 0;
     }
 
     if (session) {
