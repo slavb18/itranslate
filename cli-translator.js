@@ -41,6 +41,11 @@ const TARGET_SINK = process.argv.includes('--target')
   ? process.argv[process.argv.indexOf('--target') + 1] 
   : 'Virtual_Sink';
 
+// Set source capture device from args, defaulting to null (meaning default system recording device)
+const CAPTURE_SOURCE = process.argv.includes('--source') 
+  ? process.argv[process.argv.indexOf('--source') + 1] 
+  : null;
+
 // Detect audio command utility
 let usePipewire = false;
 try {
@@ -51,10 +56,45 @@ try {
 }
 
 console.log(`🤖 System Detection: \x1b[35m${usePipewire ? 'PipeWire (pw-record/pw-play)' : 'ALSA (arecord/aplay)'}\x1b[0m`);
+console.log(`🎙️  Mic capture device: \x1b[33m${CAPTURE_SOURCE || 'Default Microphone (System Default)'}\x1b[0m`);
 console.log(`🎙️  Mic capture rate: \x1b[33m16kHz Mono 16-bit signed PCM\x1b[0m`);
 console.log(`🔊  Playback output target: \x1b[32m${TARGET_SINK}\x1b[0m`);
 console.log('💡  Make sure your loopback devices are created using pw-loopback:');
-console.log('    \x1b[34mpw-loopback -m "[ FL FR ]" --capture-props="media.class=Audio/Sink node.name=Virtual_Sink node.description=\'Virtual_Sink\'" --playback-props="media.class=Audio/Source node.name=Virtual_Source node.description=\'Virtual_Microphone\'"\x1b[0m\n');
+console.log('    \x1b[34mpw-loopback -m "[ FL FR ]" --capture-props="media.class=Audio/Sink node.name=Virtual_Sink node.description=\'Virtual_Sink\'" --playback-props="media.class=Audio/Source node.name=Virtual_Source node.description=\'Virtual_Microphone\'"\x1b[0m');
+console.log('🌟  \x1b[1;33mCRITICAL ROUTING NOTICE:\x1b[0m If your system default microphone automatically changes to "Virtual_Source" (silence),');
+console.log('    it will stream silent chunks to Gemini, resulting in NO translation output. To override and target a physical mic, use:');
+console.log(`    \x1b[36mnode cli-translator.js --source <your_physical_mic_name_or_id>\x1b[0m\n`);
+
+// Perform some quick Pipewire/PulseAudio node diagnostics on startup
+try {
+  console.log('🔍 \x1b[34m[SYSTEM AUDIO ROUTING DIAGNOSTICS]\x1b[0m');
+  if (usePipewire) {
+    const nodes = execSync('pw-link -i -o 2>/dev/null', { encoding: 'utf8' });
+    console.log('Active Pipewire I/O Links:\n' + (nodes.trim() || 'No active links found. (Checking loopback nodes other ways...)'));
+  }
+  const sources = execSync('pactl list sources short 2>/dev/null || true', { encoding: 'utf8' });
+  if (sources.trim()) {
+    console.log('\n--- PulseAudio/PipeWire Sources (Capture devices) ---');
+    console.log(sources.trim());
+    console.log('\n💡 Tip: Look at the names/IDs above. If you see your physical microphone, pass its ID/Name via the --source option!');
+  }
+  const sinks = execSync('pactl list sinks short 2>/dev/null || true', { encoding: 'utf8' });
+  if (sinks.trim()) {
+    console.log('\n--- PulseAudio/PipeWire Sinks (Playback targets) ---');
+    console.log(sinks.trim());
+  }
+} catch (diagErr) {
+  console.log('⚠️  Could not run complete command diagnostics, continuing to app startup...');
+}
+console.log('\x1b[34m────────────────────────────────────────────────────────\x1b[0m\n');
+
+// Clean start for the physical debug audio translation trace file
+const DEBUG_AUDIO_FILE = './debug_received_english.pcm';
+try {
+  if (fs.existsSync(DEBUG_AUDIO_FILE)) {
+    fs.unlinkSync(DEBUG_AUDIO_FILE);
+  }
+} catch (e) {}
 
 async function main() {
   console.log('📡 Connecting to Gemini Live Translate API...');
@@ -89,11 +129,28 @@ async function main() {
               process.stdout.write(`🇺🇸  English Translation: \x1b[32;1m${content.outputTranscription.text}\x1b[0m\n`);
             }
             if (content.modelTurn?.parts) {
+              let audioPartsCount = 0;
+              let totalAudioBytes = 0;
               for (const part of content.modelTurn.parts) {
                 if (part.inlineData) {
+                  audioPartsCount++;
+                  const rawData = Buffer.from(part.inlineData.data, 'base64');
+                  totalAudioBytes += rawData.length;
+                  
+                  // Progressively write translated audio PCM into physical file
+                  try {
+                    fs.appendFileSync(DEBUG_AUDIO_FILE, rawData);
+                  } catch (writeErr) {
+                    console.error('⚠️ Failed to append to diagnostic sound file:', writeErr.message);
+                  }
+
                   // Direct binary audio playback channel
                   playTranslatedPcm(part.inlineData.data);
                 }
+              }
+              if (audioPartsCount > 0) {
+                console.log(`📡 [Audio Received] Decoded ${audioPartsCount} English speech frames (${totalAudioBytes} bytes) from Gemini and streamed to local playback.`);
+                console.log(`💾 [Diag File Log] Appended to ${DEBUG_AUDIO_FILE} (size: ${fs.statSync(DEBUG_AUDIO_FILE).size} bytes). Run 'pw-play --rate=24000 ${DEBUG_AUDIO_FILE}' to local-test!`);
               }
             }
           }
@@ -212,6 +269,7 @@ function startAudioStreaming(session) {
         '--format=s16',
         `--rate=${RECORD_RATE}`,
         '--channels=1',
+        ...(CAPTURE_SOURCE ? [`--target=${CAPTURE_SOURCE}`] : []),
         '-'
       ]
     : [
@@ -219,6 +277,7 @@ function startAudioStreaming(session) {
         '-f', 'S16_LE',
         '-r', `${RECORD_RATE}`,
         '-c', '1',
+        ...(CAPTURE_SOURCE ? ['-D', CAPTURE_SOURCE] : []),
         '-'
       ];
 
@@ -258,6 +317,8 @@ function startAudioStreaming(session) {
 
   let hasSkippedWavHeader = false;
 
+  let silentChunksCount = 0;
+
   recordProcess.stdout.on('data', (chunk) => {
     let audioData = chunk;
     
@@ -271,6 +332,32 @@ function startAudioStreaming(session) {
     }
 
     if (audioData.length === 0) return;
+
+    // Analyze amplitude to detect 100% digital silence (muted hardware or wrong loopback source node)
+    let maxVal = 0;
+    for (let i = 0; i < audioData.length; i += 2) {
+      if (i + 1 < audioData.length) {
+        const sample = audioData.readInt16LE(i);
+        const absVal = Math.abs(sample);
+        if (absVal > maxVal) maxVal = absVal;
+      }
+    }
+
+    if (maxVal < 10) {
+      silentChunksCount++;
+      if (silentChunksCount === 80) { // after ~8-10 seconds of pure silence
+        console.warn('\n\x1b[33m⚠️  AUDIO STAGE WARNING: Captured stream is 100% digitally silent (flatline)!\x1b[0m');
+        console.warn('   This usually means your physical microphone is muted in your OS settings or');
+        console.warn('   PipeWire was routed to your Virtual_Source/Sink instead of your physical voice capture device.');
+        console.warn('   Run standard diagnostics or launch with explicit input:');
+        console.warn('   \x1b[36mnode cli-translator.js --source <your-physical-microphone-id-or-name>\x1b[0m\n');
+      }
+    } else {
+      if (silentChunksCount >= 80) {
+        console.log('\n\x1b[32m🎤 [Voice Stream] Real audio signal detected! Mute or silence resolved.\x1b[0m\n');
+      }
+      silentChunksCount = 0;
+    }
 
     chunkCount++;
     totalBytesSent += audioData.length;
