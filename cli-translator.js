@@ -89,20 +89,76 @@ try {
 console.log('\x1b[34m────────────────────────────────────────────────────────\x1b[0m\n');
 
 // Clean start for the physical debug audio translation trace files
-const DEBUG_AUDIO_FILE = './debug_received_english.pcm';
-const DEBUG_INPUT_FILE = './debug_captured_russian_mic.pcm';
+const DEBUG_AUDIO_FILE = './debug_received_english.wav';
+const DEBUG_INPUT_FILE = './debug_captured_russian_mic.wav';
 
-try {
-  if (fs.existsSync(DEBUG_AUDIO_FILE)) {
-    fs.unlinkSync(DEBUG_AUDIO_FILE);
+// Standard WAV Header Creator (writes standard info block)
+function writeWavHeader(fd, sampleRate, numChannels, bitsPerSample, totalAudioLen = 0) {
+  const buffer = Buffer.alloc(44);
+  
+  // RIFF identifier
+  buffer.write('RIFF', 0);
+  // Total file size minus 8 bytes of standard header (if real size is provided; otherwise huge size for streams)
+  const fileSize = totalAudioLen > 0 ? (totalAudioLen + 36) : 2147483647;
+  buffer.writeUInt32LE(fileSize, 4); 
+  buffer.write('WAVE', 8);
+  
+  // fmt chunk
+  buffer.write('fmt ', 12);
+  buffer.writeUInt32LE(16, 16); // Subchunk1Size
+  buffer.writeUInt16LE(1, 20);  // AudioFormat (1 = Linear PCM)
+  buffer.writeUInt16LE(numChannels, 22);
+  buffer.writeUInt32LE(sampleRate, 24);
+  const byteRate = (sampleRate * numChannels * bitsPerSample) / 8;
+  buffer.writeUInt32LE(byteRate, 28);
+  const blockAlign = (numChannels * bitsPerSample) / 8;
+  buffer.writeUInt16LE(blockAlign, 32);
+  buffer.writeUInt16LE(bitsPerSample, 34);
+  
+  // data chunk
+  buffer.write('data', 36);
+  const dataSize = totalAudioLen > 0 ? totalAudioLen : 2147483603;
+  buffer.writeUInt32LE(dataSize, 40);
+  
+  try {
+    fs.writeSync(fd, buffer, 0, 44, 0);
+  } catch (err) {
+    console.error('⚠️ Error writing legacy/current WAV header:', err.message);
   }
-} catch (e) {}
+}
 
-try {
-  if (fs.existsSync(DEBUG_INPUT_FILE)) {
-    fs.unlinkSync(DEBUG_INPUT_FILE);
+function initializeWavFile(filepath, sampleRate) {
+  try {
+    if (fs.existsSync(filepath)) {
+      fs.unlinkSync(filepath);
+    }
+    const fd = fs.openSync(filepath, 'w');
+    writeWavHeader(fd, sampleRate, 1, 16, 0);
+    fs.closeSync(fd);
+  } catch (err) {
+    console.error(`⚠️ Failed to initialize diagnostic WAV file at ${filepath}:`, err.message);
   }
-} catch (e) {}
+}
+
+function finalizeWavFile(filepath, sampleRate) {
+  try {
+    if (!fs.existsSync(filepath)) return;
+    const stats = fs.statSync(filepath);
+    const totalAudioLen = stats.size - 44;
+    if (totalAudioLen <= 0) return;
+
+    const fd = fs.openSync(filepath, 'r+');
+    writeWavHeader(fd, sampleRate, 1, 16, totalAudioLen);
+    fs.closeSync(fd);
+    console.log(`\n💾 [Diag File Log] Finalized compliant WAV file: ${filepath} (${Math.round(stats.size/1024)} KB, duration: ${(totalAudioLen / (sampleRate * 2)).toFixed(1)}s)`);
+  } catch (err) {
+    console.error(`⚠️ Failed to finalize compliant WAV header for ${filepath}:`, err.message);
+  }
+}
+
+// Initializing diagnostic files as WAV
+initializeWavFile(DEBUG_AUDIO_FILE, PLAYBACK_RATE);
+initializeWavFile(DEBUG_INPUT_FILE, RECORD_RATE);
 
 async function main() {
   console.log('📡 Connecting to Gemini Live Translate API...');
@@ -158,7 +214,7 @@ async function main() {
               }
               if (audioPartsCount > 0) {
                 console.log(`📡 [Audio Received] Decoded ${audioPartsCount} English speech frames (${totalAudioBytes} bytes) from Gemini and streamed to local playback.`);
-                console.log(`💾 [Diag File Log] Appended to ${DEBUG_AUDIO_FILE} (size: ${fs.statSync(DEBUG_AUDIO_FILE).size} bytes). Run 'pw-play --rate=24000 ${DEBUG_AUDIO_FILE}' to local-test!`);
+                console.log(`💾 [Diag File Log] Appended to ${DEBUG_AUDIO_FILE} (size: ${fs.statSync(DEBUG_AUDIO_FILE).size} bytes). Run 'pw-play ${DEBUG_AUDIO_FILE}' to play/verify!`);
               }
             }
           }
@@ -168,6 +224,8 @@ async function main() {
         },
         onclose: (evt) => {
           console.log('\n\x1b[31m🔌 Session closed:\x1b[0m', evt.reason || 'Remote hangup');
+          finalizeWavFile(DEBUG_INPUT_FILE, RECORD_RATE);
+          finalizeWavFile(DEBUG_AUDIO_FILE, PLAYBACK_RATE);
           process.exit(0);
         }
       }
@@ -414,10 +472,17 @@ function startAudioStreaming(session) {
     }
   });
 
-  process.on('SIGINT', () => {
+  function shutdownGracefully() {
     console.log('\nShutting down translator CLI session gracefully...');
+    
+    // Finalize WAV headers with real captured lengths so they are immediately playable anywhere
+    finalizeWavFile(DEBUG_INPUT_FILE, RECORD_RATE);
+    finalizeWavFile(DEBUG_AUDIO_FILE, PLAYBACK_RATE);
+
     try {
-      recordProcess.kill('SIGINT');
+      if (recordProcess) {
+        recordProcess.kill('SIGINT');
+      }
     } catch(e){}
     if (playbackProcess) {
       try {
@@ -425,7 +490,9 @@ function startAudioStreaming(session) {
       } catch(e){}
     }
     process.exit(0);
-  });
+  }
+
+  process.on('SIGINT', shutdownGracefully);
 }
 
 main();
