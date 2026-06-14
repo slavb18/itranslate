@@ -350,11 +350,12 @@ function startAudioStreaming(session) {
         '--format=s16',
         `--rate=${RECORD_RATE}`,
         '--channels=1',
+        '--file-format=wav',
         ...(CAPTURE_SOURCE ? [`--target=${CAPTURE_SOURCE}`] : []),
         '-'
       ]
     : [
-        '-t', 'raw',
+        '-t', 'wav',
         '-f', 'S16_LE',
         '-r', `${RECORD_RATE}`,
         '-c', '1',
@@ -399,7 +400,7 @@ function startAudioStreaming(session) {
   let isHeaderSkipped = false;
   let rawInputBuffer = Buffer.alloc(0);
   let audioSendBuffer = Buffer.alloc(0);
-  const CHUNK_SEND_SIZE = 4096; // ~128ms at 16kHz 16-bit Mono (32KB/sec)
+  const CHUNK_SEND_SIZE = 8192; // ~256ms at 16kHz 16-bit Mono (32KB/sec)
 
   let silentChunksCount = 0;
   let rollingMaxPeak = 0;
