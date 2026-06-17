@@ -16,6 +16,46 @@ import { GoogleGenAI } from '@google/genai';
 import dotenv from 'dotenv';
 import fs from 'fs';
 
+if (process.argv.includes('--help') || process.argv.includes('-h')) {
+  console.log(`
+🌐 Russian 🔄 English Real-Time Live Voice Translator CLI
+
+Использование:
+  bun cli-translator.js [параметры]
+  node cli-translator.js [параметры]
+
+Параметры:
+  --input, --source      Имя или ID физического микрофона для захвата звука (русская речь).
+                          Пример: --input alsa_input.usb-H365_USB_Headset_H361_9-00.mono-fallback
+                          По умолчанию используется системное устройство ввода.
+
+  --target               Имя виртуального динамика/направления воспроизведения (английский перевод).
+                          По умолчанию: Virtual_Sink
+
+  --record-source        Путь для сохранения WAV-записи оригинального русского голоса.
+                          Пример: --record-source /tmp/source.wav
+                          Если не передан, запись не ведется.
+
+  --record-translate     Путь для сохранения WAV-записи переведённого английского звука.
+                          Пример: --record-translate /tmp/translate.wav
+                          Если не передан, запись не ведется.
+
+  -h, --help             Показать эту справку.
+
+Инструкция по настройке виртуального микрофона:
+  Для трансляции звука в Zoom выполните в терминале команду создания виртуальных устройств:
+    pw-loopback -m "[ FL FR ]" \\
+      --capture-props="media.class=Audio/Sink node.name=Virtual_Sink node.description='Virtual_Sink'" \\
+      --playback-props="media.class=Audio/Source node.name=Virtual_Source node.description='Virtual_Microphone'"
+
+  После этого:
+    1. Запустите данный скрипт.
+    2. В Zoom выберите микрофон "Virtual_Microphone" (Virtual_Source).
+    3. (Рекомендуется) В настройках звука Zoom установите подавление шума на "Low" (Низкое), чтобы голос перевода не глушился.
+  `);
+  process.exit(0);
+}
+
 dotenv.config();
 
 const API_KEY = process.env.GEMINI_API_KEY;
@@ -26,7 +66,14 @@ if (!API_KEY) {
   process.exit(1);
 }
 
-const ai = new GoogleGenAI({ apiKey: API_KEY });
+const ai = new GoogleGenAI({ 
+  apiKey: API_KEY,
+  httpOptions: {
+    headers: {
+      'User-Agent': 'aistudio-build',
+    }
+  }
+});
 
 console.log('\x1b[36m┌────────────────────────────────────────────────────────┐');
 console.log('│  🌐 Russian 🔄 English REAL-TIME LIVE VOICE TRANSLATOR  │');
@@ -44,7 +91,9 @@ const TARGET_SINK = process.argv.includes('--target')
 // Set source capture device from args, defaulting to null (meaning default system recording device)
 const CAPTURE_SOURCE = process.argv.includes('--source') 
   ? process.argv[process.argv.indexOf('--source') + 1] 
-  : null;
+  : (process.argv.includes('--input') 
+    ? process.argv[process.argv.indexOf('--input') + 1] 
+    : null);
 
 // Detect audio command utility
 let usePipewire = false;
@@ -89,8 +138,15 @@ try {
 console.log('\x1b[34m────────────────────────────────────────────────────────\x1b[0m\n');
 
 // Clean start for the physical debug audio translation trace files
-const DEBUG_AUDIO_FILE = './debug_received_english.wav';
-const DEBUG_INPUT_FILE = './debug_captured_russian_mic.wav';
+const RECORD_SOURCE_PATH = process.argv.includes('--record-source')
+  ? process.argv[process.argv.indexOf('--record-source') + 1]
+  : null;
+
+const RECORD_TRANSLATE_PATH = process.argv.includes('--record-translate')
+  ? process.argv[process.argv.indexOf('--record-translate') + 1]
+  : (process.argv.includes('--record-tranlate')
+    ? process.argv[process.argv.indexOf('--record-tranlate') + 1]
+    : null);
 
 // Standard WAV Header Creator (writes standard info block)
 function writeWavHeader(fd, sampleRate, numChannels, bitsPerSample, totalAudioLen = 0) {
@@ -156,9 +212,13 @@ function finalizeWavFile(filepath, sampleRate) {
   }
 }
 
-// Initializing diagnostic files as WAV
-initializeWavFile(DEBUG_AUDIO_FILE, PLAYBACK_RATE);
-initializeWavFile(DEBUG_INPUT_FILE, RECORD_RATE);
+// Initializing diagnostic files as WAV if requested
+if (RECORD_TRANSLATE_PATH) {
+  initializeWavFile(RECORD_TRANSLATE_PATH, PLAYBACK_RATE);
+}
+if (RECORD_SOURCE_PATH) {
+  initializeWavFile(RECORD_SOURCE_PATH, RECORD_RATE);
+}
 
 async function main() {
   console.log('📡 Connecting to Gemini Live Translate API...');
@@ -181,7 +241,6 @@ async function main() {
           console.log('\x1b[32m🟩 Gemini Live API Connected successfully!\x1b[0m');
           console.log('\x1b[1mSpeak in Russian and listen/route the translated English output.\x1b[0m');
           console.log('----------------------------------------------------');
-          startAudioStreaming(session);
         },
         onmessage: (message) => {
           // Log key attributes of the incoming message for immediate diagnosis
@@ -208,10 +267,12 @@ async function main() {
                   totalAudioBytes += rawData.length;
                   
                   // Progressively write translated audio PCM into physical file
-                  try {
-                    fs.appendFileSync(DEBUG_AUDIO_FILE, rawData);
-                  } catch (writeErr) {
-                    console.error('⚠️ Failed to append to diagnostic sound file:', writeErr.message);
+                  if (RECORD_TRANSLATE_PATH) {
+                    try {
+                      fs.appendFileSync(RECORD_TRANSLATE_PATH, rawData);
+                    } catch (writeErr) {
+                      console.error('⚠️ Failed to append to diagnostic sound file:', writeErr.message);
+                    }
                   }
 
                   // Direct binary audio playback channel
@@ -220,7 +281,9 @@ async function main() {
               }
               if (audioPartsCount > 0) {
                 console.log(`\n📡 [Audio Received] Decoded ${audioPartsCount} English speech frames (${totalAudioBytes} bytes) from Gemini and streamed to local playback.`);
-                console.log(`💾 [Diag File Log] Appended to ${DEBUG_AUDIO_FILE} (size: ${fs.statSync(DEBUG_AUDIO_FILE).size} bytes). Run 'pw-play ${DEBUG_AUDIO_FILE}' to play/verify!`);
+                if (RECORD_TRANSLATE_PATH) {
+                  console.log(`💾 [Diag File Log] Appended to ${RECORD_TRANSLATE_PATH} (size: ${fs.statSync(RECORD_TRANSLATE_PATH).size} bytes). Run 'pw-play ${RECORD_TRANSLATE_PATH}' to play/verify!`);
+                }
               }
             }
             if (content.turnComplete) {
@@ -239,12 +302,17 @@ async function main() {
         },
         onclose: (evt) => {
           console.log('\n\x1b[31m🔌 Session closed:\x1b[0m', evt.reason || 'Remote hangup');
-          finalizeWavFile(DEBUG_INPUT_FILE, RECORD_RATE);
-          finalizeWavFile(DEBUG_AUDIO_FILE, PLAYBACK_RATE);
+          if (RECORD_SOURCE_PATH) {
+            finalizeWavFile(RECORD_SOURCE_PATH, RECORD_RATE);
+          }
+          if (RECORD_TRANSLATE_PATH) {
+            finalizeWavFile(RECORD_TRANSLATE_PATH, PLAYBACK_RATE);
+          }
           process.exit(0);
         }
       }
     });
+    startAudioStreaming(session);
   } catch (err) {
     console.error('\x1b[31m❌ Failed to establish live session:\x1b[0m', err);
     process.exit(1);
@@ -290,6 +358,9 @@ function playTranslatedPcm(base64Audio) {
     const args = usePipewire 
       ? [
           `--target=${TARGET_SINK}`,
+          '--rate=24000',
+          '--channels=1',
+          '--format=s16',
           '-'
         ]
       : [
@@ -326,15 +397,6 @@ function playTranslatedPcm(base64Audio) {
   if (playbackProcess && playbackProcess.stdin.writable) {
     try {
       const audioBuffer = Buffer.from(base64Audio, 'base64');
-      
-      // For PipeWire, prepend a standard WAV container header so pw-play understands it
-      if (usePipewire && !isPlaybackHeaderSent) {
-        const header = createWavHeader(PLAYBACK_RATE, 1, 16);
-        playbackProcess.stdin.write(header);
-        isPlaybackHeaderSent = true;
-        console.log(`🔊 [Playback Channel] Pre-pended standard WAV header to stdin stream.`);
-      }
-
       playbackProcess.stdin.write(audioBuffer);
     } catch (e) {
       console.error(`❌ Playback channel buffering failure:`, e.message);
@@ -435,10 +497,12 @@ function startAudioStreaming(session) {
     if (!pcmData || pcmData.length === 0) return;
 
     // Append to diagnostic CAPTURE file for offline playing/testing
-    try {
-      fs.appendFileSync(DEBUG_INPUT_FILE, pcmData);
-    } catch (writeErr) {
-      console.error('⚠️ Failed to append raw PCM chunk to diagnostic file:', writeErr.message);
+    if (RECORD_SOURCE_PATH) {
+      try {
+        fs.appendFileSync(RECORD_SOURCE_PATH, pcmData);
+      } catch (writeErr) {
+        console.error('⚠️ Failed to append raw PCM chunk to diagnostic file:', writeErr.message);
+      }
     }
 
     // Accumulate the PCM chunks to send a steady, appropriately sized stream of buffers to Gemini
@@ -484,10 +548,13 @@ function startAudioStreaming(session) {
       // Periodically report streaming health status & amplitude peaks to terminal (every 40 chunks = ~4-5s)
       if (chunkCount % 40 === 0) {
         let inputSize = 0;
-        try {
-          inputSize = fs.statSync(DEBUG_INPUT_FILE).size;
-        } catch (e) {}
-        process.stdout.write(`\r\x1b[36m⚡ Audio Live Tracker: Captured ${chunkCount} chunks (${Math.round(totalBytesSent / 1024)} KB sent so far) | Signal Level: [Peak Value: ${rollingMaxPeak}/32767] | Saved to File: ${Math.round(inputSize / 1024)} KB\x1b[0m`);
+        if (RECORD_SOURCE_PATH) {
+          try {
+            inputSize = fs.statSync(RECORD_SOURCE_PATH).size;
+          } catch (e) {}
+        }
+        const savedFileStr = RECORD_SOURCE_PATH ? ` | Saved to File: ${Math.round(inputSize / 1024)} KB` : '';
+        process.stdout.write(`\r\x1b[36m⚡ Audio Live Tracker: Captured ${chunkCount} chunks (${Math.round(totalBytesSent / 1024)} KB sent so far) | Signal Level: [Peak Value: ${rollingMaxPeak}/32767]${savedFileStr}\x1b[0m`);
         rollingMaxPeak = 0;
       }
 
@@ -519,8 +586,12 @@ function startAudioStreaming(session) {
     console.log('\nShutting down translator CLI session gracefully...');
     
     // Finalize WAV headers with real captured lengths so they are immediately playable anywhere
-    finalizeWavFile(DEBUG_INPUT_FILE, RECORD_RATE);
-    finalizeWavFile(DEBUG_AUDIO_FILE, PLAYBACK_RATE);
+    if (RECORD_SOURCE_PATH) {
+      finalizeWavFile(RECORD_SOURCE_PATH, RECORD_RATE);
+    }
+    if (RECORD_TRANSLATE_PATH) {
+      finalizeWavFile(RECORD_TRANSLATE_PATH, PLAYBACK_RATE);
+    }
 
     try {
       if (recordProcess) {
