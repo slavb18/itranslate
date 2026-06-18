@@ -40,6 +40,14 @@ if (process.argv.includes('--help') || process.argv.includes('-h')) {
                           Пример: --record-translate /tmp/translate.wav
                           Если не передан, запись не ведется.
 
+  --context              Путь к текстовому файлу с глоссарием/контекстом для точного перевода терминов.
+                          Пример: --context file.txt
+                          Если не передан, дополнительный контекст не передается.
+
+  --lang, --language     Язык, на который переводить (en - английский, zh - китайский).
+                          Пример: --lang zh
+                          По умолчанию: en
+
   -h, --help             Показать эту справку.
 
 Инструкция по настройке виртуального микрофона:
@@ -163,6 +171,38 @@ const RECORD_TRANSLATE_PATH = process.argv.includes('--record-translate')
     ? process.argv[process.argv.indexOf('--record-tranlate') + 1]
     : null);
 
+const CONTEXT_FILE_PATH = process.argv.includes('--context')
+  ? process.argv[process.argv.indexOf('--context') + 1]
+  : null;
+
+let contextText = null;
+if (CONTEXT_FILE_PATH) {
+  try {
+    contextText = fs.readFileSync(CONTEXT_FILE_PATH, 'utf8');
+    if (SHOULD_DEBUG) {
+      console.log(`📖 Loaded context/glossary from: ${CONTEXT_FILE_PATH}`);
+    }
+  } catch (err) {
+    console.error(`⚠️ Failed to read context file from ${CONTEXT_FILE_PATH}:`, err.message);
+  }
+}
+
+const RAW_LANG = process.argv.includes('--lang')
+  ? process.argv[process.argv.indexOf('--lang') + 1]
+  : (process.argv.includes('--language')
+    ? process.argv[process.argv.indexOf('--language') + 1]
+    : 'en');
+
+let targetLanguageCode = 'en';
+let targetLanguageName = 'English';
+let targetLanguageFlag = '🇺🇸';
+
+if (['zh', 'cn', 'chinese', 'китайский'].includes(RAW_LANG.toLowerCase())) {
+  targetLanguageCode = 'zh';
+  targetLanguageName = 'Chinese';
+  targetLanguageFlag = '🇨🇳';
+}
+
 // Standard WAV Header Creator (writes standard info block)
 function writeWavHeader(fd, sampleRate, numChannels, bitsPerSample, totalAudioLen = 0) {
   const buffer = Buffer.alloc(44);
@@ -260,15 +300,28 @@ async function connectWithRetry() {
           inputAudioTranscription: {},
           outputAudioTranscription: {},
           translationConfig: {
-            targetLanguageCode: "en",
+            targetLanguageCode: targetLanguageCode,
             echoTargetLanguage: false
-          }
+          },
+          ...(contextText ? {
+            systemInstruction: {
+              parts: [{
+                text: `You are a real-time voice translator. Translate all input spoken in Russian to ${targetLanguageName}. Use this glossary/context to translate specific terms accurately: \n\n${contextText}`
+              }]
+            }
+          } : {
+            systemInstruction: {
+              parts: [{
+                text: `You are a real-time voice translator. Translate all input spoken in Russian to ${targetLanguageName}.`
+              }]
+            }
+          })
         },
         callbacks: {
           onopen: () => {
             if (SHOULD_DEBUG) {
               console.log(`\x1b[32m🟩 Gemini Live API Connected successfully using Key #${currentKeyIndex + 1}!\x1b[0m`);
-              console.log('\x1b[1mSpeak in Russian and listen/route the translated English output.\x1b[0m');
+              console.log(`\x1b[1mSpeak in Russian and listen/route the translated ${targetLanguageName} output.\x1b[0m`);
               console.log('----------------------------------------------------');
             }
             isReconnecting = false;
@@ -286,7 +339,7 @@ async function connectWithRetry() {
                 process.stdout.write(`\n🇷🇺  Russian Input:  \x1b[33m${content.inputTranscription.text}\x1b[0m\n`);
               }
               if (content.outputTranscription?.text) {
-                process.stdout.write(`\n🇺🇸  English Translation: \x1b[32;1m${content.outputTranscription.text}\x1b[0m\n`);
+                process.stdout.write(`\n${targetLanguageFlag}  ${targetLanguageName} Translation: \x1b[32;1m${content.outputTranscription.text}\x1b[0m\n`);
               }
               if (content.modelTurn?.parts) {
                 let audioPartsCount = 0;
