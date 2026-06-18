@@ -58,26 +58,37 @@ if (process.argv.includes('--help') || process.argv.includes('-h')) {
 
 dotenv.config();
 
-const API_KEY = process.env.GEMINI_API_KEY;
-if (!API_KEY) {
-  console.error('\x1b[31mError: GEMINI_API_KEY environment variable is not set!\x1b[0m');
-  console.log('Please set it in your environment before running:');
-  console.log('  \x1b[1mexport GEMINI_API_KEY="your_api_key_here"\x1b[0m\n');
+const SHOULD_DEBUG = process.argv.includes('--debug');
+
+const KEYS = Object.keys(process.env)
+  .filter(key => key === 'GEMINI_API_KEY' || key.startsWith('GEMINI_API_KEY_'))
+  .sort((a, b) => {
+    if (a === 'GEMINI_API_KEY') return -1;
+    if (b === 'GEMINI_API_KEY') return 1;
+    const numA = parseInt(a.replace('GEMINI_API_KEY_', ''), 10);
+    const numB = parseInt(b.replace('GEMINI_API_KEY_', ''), 10);
+    if (!isNaN(numA) && !isNaN(numB)) {
+      return numA - numB;
+    }
+    return a.localeCompare(b);
+  })
+  .map(key => process.env[key])
+  .filter(val => val && val.trim() !== '');
+
+if (KEYS.length === 0) {
+  console.error('\x1b[31mError: No GEMINI_API_KEY or GEMINI_API_KEY_... environment variables found!\x1b[0m');
   process.exit(1);
 }
 
-const ai = new GoogleGenAI({ 
-  apiKey: API_KEY,
-  httpOptions: {
-    headers: {
-      'User-Agent': 'aistudio-build',
-    }
-  }
-});
+let currentKeyIndex = 0;
+let activeSession = null;
+let isReconnecting = false;
 
-console.log('\x1b[36m┌────────────────────────────────────────────────────────┐');
-console.log('│  🌐 Russian 🔄 English REAL-TIME LIVE VOICE TRANSLATOR  │');
-console.log('└────────────────────────────────────────────────────────┘\x1b[0m');
+if (SHOULD_DEBUG) {
+  console.log('\x1b[36m┌────────────────────────────────────────────────────────┐');
+  console.log('│  🌐 Russian 🔄 English REAL-TIME LIVE VOICE TRANSLATOR  │');
+  console.log('└────────────────────────────────────────────────────────┘\x1b[0m');
+}
 
 // Audio specifications
 const RECORD_RATE = 16000;
@@ -104,38 +115,42 @@ try {
   usePipewire = false;
 }
 
-console.log(`🤖 System Detection: \x1b[35m${usePipewire ? 'PipeWire (pw-record/pw-play)' : 'ALSA (arecord/aplay)'}\x1b[0m`);
-console.log(`🎙️  Mic capture device: \x1b[33m${CAPTURE_SOURCE || 'Default Microphone (System Default)'}\x1b[0m`);
-console.log(`🎙️  Mic capture rate: \x1b[33m16kHz Mono 16-bit signed PCM\x1b[0m`);
-console.log(`🔊  Playback output target: \x1b[32m${TARGET_SINK}\x1b[0m`);
-console.log('💡  Make sure your loopback devices are created using pw-loopback:');
-console.log('    \x1b[34mpw-loopback -m "[ FL FR ]" --capture-props="media.class=Audio/Sink node.name=Virtual_Sink node.description=\'Virtual_Sink\'" --playback-props="media.class=Audio/Source node.name=Virtual_Source node.description=\'Virtual_Microphone\'"\x1b[0m');
-console.log('🌟  \x1b[1;33mCRITICAL ROUTING NOTICE:\x1b[0m If your system default microphone automatically changes to "Virtual_Source" (silence),');
-console.log('    it will stream silent chunks to Gemini, resulting in NO translation output. To override and target a physical mic, use:');
-console.log(`    \x1b[36mnode cli-translator.js --source <your_physical_mic_name_or_id>\x1b[0m\n`);
+if (SHOULD_DEBUG) {
+  console.log(`🤖 System Detection: \x1b[35m${usePipewire ? 'PipeWire (pw-record/pw-play)' : 'ALSA (arecord/aplay)'}\x1b[0m`);
+  console.log(`🎙️  Mic capture device: \x1b[33m${CAPTURE_SOURCE || 'Default Microphone (System Default)'}\x1b[0m`);
+  console.log(`🎙️  Mic capture rate: \x1b[33m16kHz Mono 16-bit signed PCM\x1b[0m`);
+  console.log(`🔊  Playback output target: \x1b[32m${TARGET_SINK}\x1b[0m`);
+  console.log('💡  Make sure your loopback devices are created using pw-loopback:');
+  console.log('    \x1b[34mpw-loopback -m "[ FL FR ]" --capture-props="media.class=Audio/Sink node.name=Virtual_Sink node.description=\'Virtual_Sink\'" --playback-props="media.class=Audio/Source node.name=Virtual_Source node.description=\'Virtual_Microphone\'"\x1b[0m');
+  console.log('🌟  \x1b[1;33mCRITICAL ROUTING NOTICE:\x1b[0m If your system default microphone automatically changes to "Virtual_Source" (silence),');
+  console.log('    it will stream silent chunks to Gemini, resulting in NO translation output. To override and target a physical mic, use:');
+  console.log(`    \x1b[36mnode cli-translator.js --source <your_physical_mic_name_or_id>\x1b[0m\n`);
+}
 
 // Perform some quick Pipewire/PulseAudio node diagnostics on startup
-try {
-  console.log('🔍 \x1b[34m[SYSTEM AUDIO ROUTING DIAGNOSTICS]\x1b[0m');
-  if (usePipewire) {
-    const nodes = execSync('pw-link -i -o 2>/dev/null', { encoding: 'utf8' });
-    console.log('Active Pipewire I/O Links:\n' + (nodes.trim() || 'No active links found. (Checking loopback nodes other ways...)'));
+if (SHOULD_DEBUG) {
+  try {
+    console.log('🔍 \x1b[34m[SYSTEM AUDIO ROUTING DIAGNOSTICS]\x1b[0m');
+    if (usePipewire) {
+      const nodes = execSync('pw-link -i -o 2>/dev/null', { encoding: 'utf8' });
+      console.log('Active Pipewire I/O Links:\n' + (nodes.trim() || 'No active links found. (Checking loopback nodes other ways...)'));
+    }
+    const sources = execSync('pactl list sources short 2>/dev/null || true', { encoding: 'utf8' });
+    if (sources.trim()) {
+      console.log('\n--- PulseAudio/PipeWire Sources (Capture devices) ---');
+      console.log(sources.trim());
+      console.log('\n💡 Tip: Look at the names/IDs above. If you see your physical microphone, pass its ID/Name via the --source option!');
+    }
+    const sinks = execSync('pactl list sinks short 2>/dev/null || true', { encoding: 'utf8' });
+    if (sinks.trim()) {
+      console.log('\n--- PulseAudio/PipeWire Sinks (Playback targets) ---');
+      console.log(sinks.trim());
+    }
+  } catch (diagErr) {
+    console.log('⚠️  Could not run complete command diagnostics, continuing to app startup...');
   }
-  const sources = execSync('pactl list sources short 2>/dev/null || true', { encoding: 'utf8' });
-  if (sources.trim()) {
-    console.log('\n--- PulseAudio/PipeWire Sources (Capture devices) ---');
-    console.log(sources.trim());
-    console.log('\n💡 Tip: Look at the names/IDs above. If you see your physical microphone, pass its ID/Name via the --source option!');
-  }
-  const sinks = execSync('pactl list sinks short 2>/dev/null || true', { encoding: 'utf8' });
-  if (sinks.trim()) {
-    console.log('\n--- PulseAudio/PipeWire Sinks (Playback targets) ---');
-    console.log(sinks.trim());
-  }
-} catch (diagErr) {
-  console.log('⚠️  Could not run complete command diagnostics, continuing to app startup...');
+  console.log('\x1b[34m────────────────────────────────────────────────────────\x1b[0m\n');
 }
-console.log('\x1b[34m────────────────────────────────────────────────────────\x1b[0m\n');
 
 // Clean start for the physical debug audio translation trace files
 const RECORD_SOURCE_PATH = process.argv.includes('--record-source')
@@ -220,103 +235,154 @@ if (RECORD_SOURCE_PATH) {
   initializeWavFile(RECORD_SOURCE_PATH, RECORD_RATE);
 }
 
-async function main() {
-  console.log('📡 Connecting to Gemini Live Translate API...');
-  
-  let session;
-  try {
-    session = await ai.live.connect({
-      model: "gemini-3.5-live-translate-preview",
-      config: {
-        responseModalities: ["AUDIO"],
-        inputAudioTranscription: {},
-        outputAudioTranscription: {},
-        translationConfig: {
-          targetLanguageCode: "en",
-          echoTargetLanguage: false
-        }
-      },
-      callbacks: {
-        onopen: () => {
-          console.log('\x1b[32m🟩 Gemini Live API Connected successfully!\x1b[0m');
-          console.log('\x1b[1mSpeak in Russian and listen/route the translated English output.\x1b[0m');
-          console.log('----------------------------------------------------');
-        },
-        onmessage: (message) => {
-          // Log key attributes of the incoming message for immediate diagnosis
-          if (message.error) {
-            console.error('\n\x1b[31m❌ [Gemini Live Server Error]:\x1b[0m', JSON.stringify(message.error, null, 2));
-            return;
-          }
-
-          const content = message.serverContent;
-          if (content) {
-            if (content.inputTranscription?.text) {
-              process.stdout.write(`\n🇷🇺  Russian Input:  \x1b[33m${content.inputTranscription.text}\x1b[0m\n`);
-            }
-            if (content.outputTranscription?.text) {
-              process.stdout.write(`\n🇺🇸  English Translation: \x1b[32;1m${content.outputTranscription.text}\x1b[0m\n`);
-            }
-            if (content.modelTurn?.parts) {
-              let audioPartsCount = 0;
-              let totalAudioBytes = 0;
-              for (const part of content.modelTurn.parts) {
-                if (part.inlineData) {
-                  audioPartsCount++;
-                  const rawData = Buffer.from(part.inlineData.data, 'base64');
-                  totalAudioBytes += rawData.length;
-                  
-                  // Progressively write translated audio PCM into physical file
-                  if (RECORD_TRANSLATE_PATH) {
-                    try {
-                      fs.appendFileSync(RECORD_TRANSLATE_PATH, rawData);
-                    } catch (writeErr) {
-                      console.error('⚠️ Failed to append to diagnostic sound file:', writeErr.message);
-                    }
-                  }
-
-                  // Direct binary audio playback channel
-                  playTranslatedPcm(part.inlineData.data);
-                }
-              }
-              if (audioPartsCount > 0) {
-                console.log(`\n📡 [Audio Received] Decoded ${audioPartsCount} English speech frames (${totalAudioBytes} bytes) from Gemini and streamed to local playback.`);
-                if (RECORD_TRANSLATE_PATH) {
-                  console.log(`💾 [Diag File Log] Appended to ${RECORD_TRANSLATE_PATH} (size: ${fs.statSync(RECORD_TRANSLATE_PATH).size} bytes). Run 'pw-play ${RECORD_TRANSLATE_PATH}' to play/verify!`);
-                }
-              }
-            }
-            if (content.turnComplete) {
-              console.log(`\n✨ [Gemini Live Turn Complete]`);
-            }
-          } else {
-            // Log other non-content events to see if they're coming through (e.g. toolCall, or simple server pings/keepalives)
-            const keys = Object.keys(message);
-            if (keys.length > 0) {
-              console.log(`\n📡 [Gemini Metadata Message Received]: Fields: [${keys.join(', ')}]`);
-            }
-          }
-        },
-        onerror: (err) => {
-          console.error('\n\x1b[31m❌ Live Session error:\x1b[0m', err.message || err);
-        },
-        onclose: (evt) => {
-          console.log('\n\x1b[31m🔌 Session closed:\x1b[0m', evt.reason || 'Remote hangup');
-          if (RECORD_SOURCE_PATH) {
-            finalizeWavFile(RECORD_SOURCE_PATH, RECORD_RATE);
-          }
-          if (RECORD_TRANSLATE_PATH) {
-            finalizeWavFile(RECORD_TRANSLATE_PATH, PLAYBACK_RATE);
-          }
-          process.exit(0);
+async function connectWithRetry() {
+  let attempts = 0;
+  while (attempts < KEYS.length) {
+    const apiKey = KEYS[currentKeyIndex];
+    if (SHOULD_DEBUG) {
+      console.log(`📡 [Key Rotation] Attempting connection using API Key #${currentKeyIndex + 1}/${KEYS.length} (...${apiKey.slice(-5)})...`);
+    }
+    
+    const ai = new GoogleGenAI({ 
+      apiKey: apiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
         }
       }
     });
-    startAudioStreaming(session);
-  } catch (err) {
-    console.error('\x1b[31m❌ Failed to establish live session:\x1b[0m', err);
-    process.exit(1);
+
+    try {
+      const session = await ai.live.connect({
+        model: "gemini-3.5-live-translate-preview",
+        config: {
+          responseModalities: ["AUDIO"],
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
+          translationConfig: {
+            targetLanguageCode: "en",
+            echoTargetLanguage: false
+          }
+        },
+        callbacks: {
+          onopen: () => {
+            if (SHOULD_DEBUG) {
+              console.log(`\x1b[32m🟩 Gemini Live API Connected successfully using Key #${currentKeyIndex + 1}!\x1b[0m`);
+              console.log('\x1b[1mSpeak in Russian and listen/route the translated English output.\x1b[0m');
+              console.log('----------------------------------------------------');
+            }
+            isReconnecting = false;
+          },
+          onmessage: (message) => {
+            if (message.error) {
+              console.error(`\n\x1b[31m❌ [Gemini Live Server Error with Key #${currentKeyIndex + 1}]:\x1b[0m`, JSON.stringify(message.error, null, 2));
+              handleSessionError();
+              return;
+            }
+
+            const content = message.serverContent;
+            if (content) {
+              if (content.inputTranscription?.text) {
+                process.stdout.write(`\n🇷🇺  Russian Input:  \x1b[33m${content.inputTranscription.text}\x1b[0m\n`);
+              }
+              if (content.outputTranscription?.text) {
+                process.stdout.write(`\n🇺🇸  English Translation: \x1b[32;1m${content.outputTranscription.text}\x1b[0m\n`);
+              }
+              if (content.modelTurn?.parts) {
+                let audioPartsCount = 0;
+                let totalAudioBytes = 0;
+                for (const part of content.modelTurn.parts) {
+                  if (part.inlineData) {
+                    audioPartsCount++;
+                    const rawData = Buffer.from(part.inlineData.data, 'base64');
+                    totalAudioBytes += rawData.length;
+                    
+                    if (RECORD_TRANSLATE_PATH) {
+                      try {
+                        fs.appendFileSync(RECORD_TRANSLATE_PATH, rawData);
+                      } catch (writeErr) {
+                        console.error('⚠️ Failed to append to diagnostic sound file:', writeErr.message);
+                      }
+                    }
+                    playTranslatedPcm(part.inlineData.data);
+                  }
+                }
+                if (audioPartsCount > 0 && SHOULD_DEBUG) {
+                  console.log(`\n📡 [Audio Received] Decoded ${audioPartsCount} English speech frames (${totalAudioBytes} bytes) from Gemini.`);
+                  if (RECORD_TRANSLATE_PATH) {
+                    console.log(`💾 [Diag File Log] Appended to ${RECORD_TRANSLATE_PATH}`);
+                  }
+                }
+              }
+              if (content.turnComplete && SHOULD_DEBUG) {
+                console.log(`\n✨ [Gemini Live Turn Complete]`);
+              }
+            } else {
+              const keys = Object.keys(message);
+              if (keys.length > 0 && SHOULD_DEBUG) {
+                console.log(`\n📡 [Gemini Metadata Message Received]: Fields: [${keys.join(', ')}]`);
+              }
+            }
+          },
+          onerror: (err) => {
+            if (SHOULD_DEBUG) {
+              console.error(`\n\x1b[31m❌ Live Session error with Key #${currentKeyIndex + 1}:\x1b[0m`, err.message || err);
+            }
+            handleSessionError();
+          },
+          onclose: (evt) => {
+            if (SHOULD_DEBUG) {
+              console.log(`\n\x1b[31m🔌 Session closed for Key #${currentKeyIndex + 1}:\x1b[0m`, evt.reason || 'Remote hangup');
+            }
+            if (!isReconnecting) {
+              handleSessionError();
+            }
+          }
+        }
+      });
+      
+      activeSession = session;
+      return;
+    } catch (err) {
+      if (SHOULD_DEBUG) {
+        console.error(`\x1b[31m❌ Failed to connect with Key #${currentKeyIndex + 1}:\x1b[0m`, err.message || err);
+      }
+      currentKeyIndex = (currentKeyIndex + 1) % KEYS.length;
+      attempts++;
+    }
   }
+
+  console.error('\x1b[31m❌ All available API keys failed to connect. Retrying first key in 5 seconds...\x1b[0m');
+  await new Promise(resolve => setTimeout(resolve, 5000));
+  return connectWithRetry();
+}
+
+function handleSessionError() {
+  if (isReconnecting) return;
+  isReconnecting = true;
+  
+  if (SHOULD_DEBUG) {
+    console.log('🔄 Initiating API key rotation and reconnection...');
+  }
+  try {
+    if (activeSession) {
+      activeSession.close();
+    }
+  } catch (e) {}
+  activeSession = null;
+  
+  currentKeyIndex = (currentKeyIndex + 1) % KEYS.length;
+  connectWithRetry().catch(err => {
+    console.error('Fatal reconnection error:', err);
+  });
+}
+
+async function main() {
+  if (SHOULD_DEBUG) {
+    console.log('📡 Connecting to Gemini Live Translate API...');
+  }
+  await connectWithRetry();
+  startAudioStreaming();
 }
 
 // Helper to generate a WAV header for streaming (huge size)
@@ -373,7 +439,9 @@ function playTranslatedPcm(base64Audio) {
         ];
 
     const cmd = usePipewire ? 'pw-play' : 'aplay';
-    console.log(`🔊 [Playback Channel] Spawning standard audio player: \x1b[32m${cmd} ${args.join(' ')}\x1b[0m`);
+    if (SHOULD_DEBUG) {
+      console.log(`🔊 [Playback Channel] Spawning standard audio player: \x1b[32m${cmd} ${args.join(' ')}\x1b[0m`);
+    }
     
     playbackProcess = spawn(cmd, args);
     isPlaybackHeaderSent = false;
@@ -384,11 +452,15 @@ function playTranslatedPcm(base64Audio) {
 
     // Capture and display playback utility errors for user diagnosis
     playbackProcess.stderr.on('data', (data) => {
-      console.warn(`\x1b[33m[Audio Playback Warning] >>> ${data.toString().trim()}\x1b[0m`);
+      if (SHOULD_DEBUG) {
+        console.warn(`\x1b[33m[Audio Playback Warning] >>> ${data.toString().trim()}\x1b[0m`);
+      }
     });
 
     playbackProcess.on('close', (code) => {
-      console.log(`🔊 [Playback Channel] Playback process closed with code: ${code}`);
+      if (SHOULD_DEBUG) {
+        console.log(`🔊 [Playback Channel] Playback process closed with code: ${code}`);
+      }
       playbackProcess = null;
       isPlaybackHeaderSent = false;
     });
@@ -404,7 +476,7 @@ function playTranslatedPcm(base64Audio) {
   }
 }
 
-function startAudioStreaming(session) {
+function startAudioStreaming() {
   let recordProcess;
   const cmd = usePipewire ? 'pw-record' : 'arecord';
   const args = usePipewire
@@ -424,7 +496,9 @@ function startAudioStreaming(session) {
         '-'
       ];
 
-  console.log(`🎙️  [Audio Capture] Spawning driver: \x1b[34m${cmd} ${args.join(' ')}\x1b[0m`);
+  if (SHOULD_DEBUG) {
+    console.log(`🎙️  [Audio Capture] Spawning driver: \x1b[34m${cmd} ${args.join(' ')}\x1b[0m`);
+  }
 
   try {
     recordProcess = spawn(cmd, args);
@@ -440,14 +514,14 @@ function startAudioStreaming(session) {
   // Pipe Recorder stderr directly so we can diagnose permission/device issues
   recordProcess.stderr.on('data', (data) => {
     const msg = data.toString().trim();
-    if (msg) {
+    if (msg && SHOULD_DEBUG) {
       console.warn(`\x1b[33m[Microphone Hardware Warning] >>> ${msg}\x1b[5m`);
     }
   });
 
   // Setup timeout to warn user if no mic data is flowing
   const micWarningTimeout = setTimeout(() => {
-    if (chunkCount === 0) {
+    if (chunkCount === 0 && SHOULD_DEBUG) {
       console.warn('\n\x1b[33m⚠️  WARNING: No audio data has been received from the microphone after 4 seconds!\x1b[0m');
       console.warn('Common causes:');
       console.warn(' 1. Your physical microphone is muted or in use by another application.');
@@ -456,7 +530,9 @@ function startAudioStreaming(session) {
     }
   }, 4000);
 
-  console.log('\n\x1b[34m🎙️  [LIVE RECORDING] Speak into your physical microphone now...\x1b[0m');
+  if (SHOULD_DEBUG) {
+    console.log('\n\x1b[34m🎙️  [LIVE RECORDING] Speak into your physical microphone now...\x1b[0m');
+  }
 
   let isHeaderSkipped = false;
   let rawInputBuffer = Buffer.alloc(0);
@@ -528,7 +604,7 @@ function startAudioStreaming(session) {
 
       if (maxVal < 10) {
         silentChunksCount++;
-        if (silentChunksCount === 80) { // after ~8-10 seconds of pure silence
+        if (silentChunksCount === 80 && SHOULD_DEBUG) { // after ~8-10 seconds of pure silence
           console.warn('\n\x1b[33m⚠️  AUDIO STAGE WARNING: Captured stream is 100% digitally silent (flatline)!\x1b[0m');
           console.warn('   This usually means your physical microphone is muted in your OS settings or');
           console.warn('   PipeWire was routed to your Virtual_Source/Sink instead of your physical voice capture device.');
@@ -536,7 +612,7 @@ function startAudioStreaming(session) {
           console.warn('   \x1b[36mnode cli-translator.js --source <your-physical-microphone-id-or-name>\x1b[0m\n');
         }
       } else {
-        if (silentChunksCount >= 80) {
+        if (silentChunksCount >= 80 && SHOULD_DEBUG) {
           console.log('\n\x1b[32m🎤 [Voice Stream] Real audio signal detected! Mute or silence resolved.\x1b[0m\n');
         }
         silentChunksCount = 0;
@@ -546,7 +622,7 @@ function startAudioStreaming(session) {
       totalBytesSent += sendChunk.length;
 
       // Periodically report streaming health status & amplitude peaks to terminal (every 40 chunks = ~4-5s)
-      if (chunkCount % 40 === 0) {
+      if (chunkCount % 40 === 0 && SHOULD_DEBUG) {
         let inputSize = 0;
         if (RECORD_SOURCE_PATH) {
           try {
@@ -558,9 +634,9 @@ function startAudioStreaming(session) {
         rollingMaxPeak = 0;
       }
 
-      if (session) {
+      if (activeSession) {
         try {
-          session.sendRealtimeInput({
+          activeSession.sendRealtimeInput({
             audio: {
               data: sendChunk.toString('base64'),
               mimeType: `audio/pcm;rate=${RECORD_RATE}`
@@ -568,6 +644,7 @@ function startAudioStreaming(session) {
           });
         } catch (err) {
           console.error(`\r❌ Error sending audio to Gemini Live:`, err.message);
+          handleSessionError();
         }
       }
     }
@@ -575,10 +652,16 @@ function startAudioStreaming(session) {
 
   recordProcess.on('close', (code) => {
     clearTimeout(micWarningTimeout);
-    console.log(`\n🎙️  Recorder process closed (Exit Code: ${code})`);
-    if (session) {
-      console.log('🔌 Shutting down Gemini live session...');
-      session.close();
+    if (SHOULD_DEBUG) {
+      console.log(`\n🎙️  Recorder process closed (Exit Code: ${code})`);
+    }
+    if (activeSession) {
+      if (SHOULD_DEBUG) {
+        console.log('🔌 Shutting down Gemini live session...');
+      }
+      try {
+        activeSession.close();
+      } catch (e) {}
     }
   });
 
@@ -594,14 +677,20 @@ function startAudioStreaming(session) {
     }
 
     try {
+      if (activeSession) {
+        activeSession.close();
+      }
+    } catch (e) {}
+
+    try {
       if (recordProcess) {
         recordProcess.kill('SIGINT');
       }
-    } catch(e){}
+    } catch (e) {}
     if (playbackProcess) {
       try {
         playbackProcess.kill('SIGINT');
-      } catch(e){}
+      } catch (e) {}
     }
     process.exit(0);
   }
